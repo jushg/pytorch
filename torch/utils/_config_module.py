@@ -102,6 +102,10 @@ class _Config(Generic[T]):
             assert isinstance(
                 self.default, bool
             ), f"justknobs only support booleans, {self.default} is not a boolean"
+            if self.value_type is not None:
+                assert isinstance(
+                    self.value_type, bool
+                ), f"envvar configs only support booleans, {self.value_type} is not a boolean"
         if self.alias is not None:
             assert (
                 default is _UNSET_SENTINEL
