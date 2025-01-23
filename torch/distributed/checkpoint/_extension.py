@@ -1,15 +1,50 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 
 import abc
+import importlib.util
+import io
+import sys
 from collections.abc import Sequence
-from typing import IO, Type
+from typing import cast, IO, Optional, Type
+
+# introduced as collections.abc.Buffer in Python 3.12
+from typing_extensions import Buffer
 
 
 # NOTE: everything in this file is experimental, and subject to
 # change.  Feedback and bug fixes are always welcome.
 
 
-__all__ = ["Extension", "StreamTransformExtension", "ExtensionRegistry"]
+pyzstd_module_name = "pyzstd"
+
+if (pyzstd := sys.modules.get(pyzstd_module_name, None)) is not None:
+    pass
+elif (pyzstd_spec := importlib.util.find_spec(pyzstd_module_name)) is not None:
+    pyzstd = importlib.util.module_from_spec(pyzstd_spec)
+    sys.modules[pyzstd_module_name] = pyzstd
+    pyzstd_spec.loader.exec_module(pyzstd)  # type: ignore[union-attr]
+else:
+    pyzstd = None
+
+
+zstandard_module_name = "zstandard"
+
+if (zstandard := sys.modules.get(zstandard_module_name, None)) is not None:
+    pass
+elif (zstandard_spec := importlib.util.find_spec(zstandard_module_name)) is not None:
+    zstandard = importlib.util.module_from_spec(zstandard_spec)
+    sys.modules[zstandard_module_name] = zstandard
+    zstandard_spec.loader.exec_module(zstandard)  # type: ignore[union-attr]
+else:
+    zstandard = None
+
+
+__all__ = [
+    "Extension",
+    "StreamTransformExtension",
+    "ZStandard",
+    "ExtensionRegistry",
+]
 
 
 class Extension(abc.ABC):
@@ -72,10 +107,110 @@ class StreamTransformExtension(Extension):
         """
 
 
+class ZStandard(StreamTransformExtension):
+    @staticmethod
+    def is_available() -> bool:
+        return zstandard is not None or pyzstd is not None
+
+    @staticmethod
+    def from_descriptor(version: str) -> "ZStandard":
+        if version.partition(".")[0] != "1":
+            raise ValueError(f"Unknown extension {version=}")
+        if not ZStandard.is_available():
+            raise ValueError(
+                f"Stream with ZStandard compression cannot be processed because "
+                f"no module named '{zstandard_module_name}' or '{pyzstd_module_name}'"
+            )
+        return ZStandard()
+
+    @staticmethod
+    def registry_name() -> str:
+        return "stream.zstd"
+
+    def __init__(self) -> None:
+        super().__init__()
+        if not ZStandard.is_available():
+            raise ValueError(
+                f"ZStandard extension is unavailable because no module named '{zstandard_module_name}' or '{pyzstd_module_name}'"
+            )
+
+    def get_descriptor(self) -> str:
+        return f"{self.registry_name()}/1"
+
+    def transform_to(self, output: IO[bytes]) -> IO[bytes]:
+        if zstandard is not None:
+            compressor = zstandard.ZstdCompressor()  # type: ignore[union-attr]
+            return compressor.stream_writer(output)
+
+        class Writer(io.RawIOBase):
+            def __init__(self, output: IO[bytes]) -> None:
+                self.output = output
+                self.compressor = pyzstd.ZstdCompressor()  # type: ignore[union-attr]
+
+            def writeable(self) -> bool:
+                return True
+
+            def write(self, b: Buffer) -> Optional[int]:
+                outdata = self.compressor.compress(b)
+                if outdata:
+                    self.output.write(outdata)
+                return len(memoryview(b))
+
+            def flush(self) -> None:
+                outdata = self.compressor.flush()
+                if outdata:
+                    self.output.write(outdata)
+                self.output.flush()
+
+        return cast(IO[bytes], Writer(output))
+
+    def transform_from(self, input: IO[bytes]) -> IO[bytes]:
+        if zstandard is not None:
+            decompressor = zstandard.ZstdDecompressor()  # type: ignore[union-attr]
+            return decompressor.stream_reader(input)
+
+        class Reader(io.RawIOBase):
+            def __init__(self, input: IO[bytes]) -> None:
+                self.input = input
+                self.decompressor = pyzstd.EndlessZstdDecompressor()  # type: ignore[union-attr]
+
+            def readable(self) -> bool:
+                return True
+
+            def readinto(self, b: Buffer) -> Optional[int]:
+                # This needs to read enough so it can decompress
+                # something so the output doesn't look like EOF.  This
+                # means reading at least one block.  The max block
+                # size is 128KB, so we read that plus some
+                # overhead to be sure.
+
+                if self.decompressor.needs_input:
+                    indata = self.input.read((128 + 6) * 1024)
+                else:
+                    indata = b""
+
+                bview = memoryview(b)
+                blen = len(bview)
+                outdata = self.decompressor.decompress(indata, blen)
+                if outdata is None:
+                    return None
+
+                count = len(outdata)
+                bview[:count] = outdata
+                return count
+
+            def seekable(self) -> bool:
+                return False
+
+        return cast(IO[bytes], Reader(input))
+
+
 class ExtensionRegistry:
     def __init__(self) -> None:
         # Populate default registry contents
-        self.extensions: dict[str, Type[Extension]] = {}
+        self.extensions: dict[str, Type[Extension]] = {
+            cls.registry_name(): cls for cls in (ZStandard,)
+        }
 
     def register(self, cls: Type[Extension]) -> None:
         self.extensions[cls.registry_name()] = cls
